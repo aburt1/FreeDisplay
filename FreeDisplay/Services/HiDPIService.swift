@@ -86,7 +86,7 @@ final class HiDPIService: @unchecked Sendable {
         ]
 
         guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) else {
-            return "生成 Plist 数据失败"
+            return "Failed to generate Plist data"
         }
 
         // Write to a temp file first, then use privileged helper to move it
@@ -94,11 +94,13 @@ final class HiDPIService: @unchecked Sendable {
         do {
             try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
         } catch {
-            return "写入临时文件失败：\(error.localizedDescription)"
+            return "Failed to write temporary file: \(error.localizedDescription)"
         }
 
-        // Use AppleScript to get admin privileges for writing to /Library/Displays/
-        if let err = executePrivilegedCommand("mkdir -p '\(dirPath)' && cp '\(tmpPath)' '\(plistPath)'") {
+        // Use AppleScript to get admin privileges for writing to /Library/Displays/.
+        // Paths are shell-escaped to avoid injection through quotes or backslashes.
+        let cmd = "mkdir -p \(Self.shellEscape(dirPath)) && cp \(Self.shellEscape(tmpPath)) \(Self.shellEscape(plistPath))"
+        if let err = executePrivilegedCommand(cmd) {
             return err
         }
 
@@ -115,7 +117,7 @@ final class HiDPIService: @unchecked Sendable {
         let plistPath = overridePlistURL(vendor: vendor, product: product).path
         guard FileManager.default.fileExists(atPath: plistPath) else { return nil }
 
-        if let err = executePrivilegedCommand("rm -f '\(plistPath)'") {
+        if let err = executePrivilegedCommand("rm -f \(Self.shellEscape(plistPath))") {
             return err
         }
         return nil
@@ -123,23 +125,46 @@ final class HiDPIService: @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Wraps `s` in single quotes for safe inclusion in a `sh` command line.
+    /// Single-quoted strings in sh disable everything except `'`, so we close
+    /// the quote, emit an escaped quote, and reopen — the standard recipe.
+    /// All callers passing paths or untrusted data to `executePrivilegedCommand`
+    /// MUST run them through this helper first.
+    static func shellEscape(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Escapes a string for use as a literal inside an AppleScript double-quoted
+    /// string. `\` must come first, then `"`.
+    static func appleScriptEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
     /// Executes a shell command with administrator privileges via AppleScript.
+    /// The command is AppleScript-escaped here, but callers are responsible for
+    /// shell-escaping any arguments inside the command (use `shellEscape`).
     /// Returns nil on success, or an error message on failure.
     private func executePrivilegedCommand(_ command: String) -> String? {
+        // The command becomes the body of an AppleScript double-quoted string, so
+        // any `"` or `\` inside must be escaped at the AppleScript level. Without
+        // this, a `"` in the command would terminate the literal and turn the
+        // remainder into arbitrary AppleScript executing as root.
+        let escapedCommand = Self.appleScriptEscape(command)
         let script = """
-            do shell script "\(command)" with administrator privileges
+            do shell script "\(escapedCommand)" with administrator privileges
             """
         var error: NSDictionary?
         guard let appleScript = NSAppleScript(source: script) else {
-            return "创建 AppleScript 失败"
+            return "Failed to create AppleScript"
         }
         appleScript.executeAndReturnError(&error)
         if let error = error {
-            let msg = error[NSAppleScript.errorMessage] as? String ?? "未知错误"
+            let msg = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
             if msg.contains("canceled") || msg.contains("Cancel") {
-                return "用户取消了授权"
+                return "User cancelled authorization"
             }
-            return "管理员授权失败：\(msg)"
+            return "Administrator authorization failed: \(msg)"
         }
         return nil
     }

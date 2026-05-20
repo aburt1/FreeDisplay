@@ -2,6 +2,7 @@
 """Generate FreeDisplay app icon (1024x1024)."""
 
 import math
+import os
 from PIL import Image, ImageDraw, ImageFont
 
 SIZE = 1024
@@ -139,7 +140,8 @@ def main():
     refl_draw.polygon(refl_points, fill=(255, 255, 255, 18))
     img = Image.alpha_composite(img, refl_img)
 
-    out_path = "/Users/jm/Desktop/FreeDisplay/scripts/icon_1024.png"
+    # Write next to this script regardless of where it's invoked from.
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon_1024.png")
     img.save(out_path, "PNG")
     print(f"Saved: {out_path}")
 

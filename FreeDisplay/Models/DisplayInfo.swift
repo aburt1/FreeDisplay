@@ -19,6 +19,12 @@ class DisplayInfo: ObservableObject, Identifiable {
     @Published var availableModes: [DisplayMode]
     @Published var currentDisplayMode: DisplayMode?
     @Published var ddcValues: [UInt8: UInt16?] = [:]
+    /// True when the user has disconnected this display via the toggle.
+    /// macOS will see the display as offline; the panel itself enters
+    /// self-sleep because it stops receiving an HPD signal.
+    @Published var isDisconnected: Bool = false
+    /// True while a connect/disconnect call is in flight.
+    @Published var isTogglingConnection: Bool = false
     let vendorNumber: UInt32
     let modelNumber: UInt32
     let serialNumber: UInt32
@@ -64,7 +70,7 @@ class DisplayInfo: ObservableObject, Identifiable {
         self.serialNumber = CGDisplaySerialNumber(displayID)
 
         if builtin {
-            self.name = "内建显示屏"
+            self.name = "Built-in Display"
         } else {
             self.name = NSScreen.screen(for: displayID)?.localizedName ?? "Display \(displayID)"
         }

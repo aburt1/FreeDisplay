@@ -44,6 +44,21 @@ class DisplayManager: ObservableObject {
     init() {
         refreshDisplays()
         setupReconfigCallback()
+
+        // Restore persisted per-display state from the previous session: resolution,
+        // brightness, gamma, and disconnect status. Without this, ResolutionService's
+        // saved modeID only re-applied on wake-from-sleep, leaving every fresh app
+        // launch in whatever default mode WindowServer chose.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard let self else { return }
+            for display in self.displays where !display.isBuiltin {
+                ResolutionService.shared.reapplySavedModeIfNeeded(for: display.displayID)
+                BrightnessService.shared.reapplySoftwareBrightnessIfNeeded(for: display)
+                GammaService.shared.reapplyIfNeeded(for: display.displayID)
+            }
+            await DisplayConnectionService.shared.reapplyPersistedDisconnects(for: self.displays)
+        }
     }
 
     deinit {
@@ -60,24 +75,35 @@ class DisplayManager: ObservableObject {
         CGGetOnlineDisplayList(displayCount, &displayIDs, &displayCount)
 
         let currentIDs = Set(displays.map { $0.displayID })
-        let newIDSet = Set((0..<Int(displayCount)).map { displayIDs[$0] })
+        let activeIDs = Set((0..<Int(displayCount)).map { displayIDs[$0] })
 
-        // Clean up DDC cache for removed displays to prevent stale entries accumulating
-        let removedIDs = currentIDs.subtracting(newIDSet)
+        // Preserve rows for displays the user manually disconnected — those will
+        // not appear in CGGetOnlineDisplayList but we need to keep them in the
+        // menu so the user can toggle them back on.
+        let ghostIDs = DisplayConnectionService.shared.disconnectedDisplayIDs.subtracting(activeIDs)
+        let allRetainedIDs = activeIDs.union(ghostIDs)
+
+        // Only purge DDC/brightness state for displays that are TRULY gone (not active and not ghosted).
+        let removedIDs = currentIDs.subtracting(allRetainedIDs)
         removedIDs.forEach {
             DDCService.shared.clearCache(for: $0)
             BrightnessService.shared.invalidateDDCState(for: $0)
         }
 
         // Diff-based refresh: keep existing DisplayInfo objects (preserves @Published state)
-        var existingByID = Dictionary(uniqueKeysWithValues: displays.map { ($0.displayID, $0) })
+        let existingByID = Dictionary(uniqueKeysWithValues: displays.map { ($0.displayID, $0) })
 
         var updatedDisplays: [DisplayInfo] = []
         var addedDisplays: [DisplayInfo] = []
 
+        // First pass: active displays in their natural order.
         for i in 0..<Int(displayCount) {
             let id = displayIDs[i]
             if let existing = existingByID[id] {
+                // If the system reconnected it (e.g. user toggled it back on), clear the disconnect flag.
+                if existing.isDisconnected {
+                    existing.isDisconnected = false
+                }
                 updatedDisplays.append(existing)
             } else {
                 let info = DisplayInfo(displayID: id)
@@ -86,10 +112,21 @@ class DisplayManager: ObservableObject {
             }
         }
 
+        // Second pass: keep ghosts (user-disconnected displays) appended at the end.
+        for ghostID in ghostIDs {
+            if let existing = existingByID[ghostID] {
+                existing.isDisconnected = true
+                updatedDisplays.append(existing)
+            }
+            // If we don't have an existing DisplayInfo for a ghost (shouldn't normally happen),
+            // we can't reconstruct one — CGDisplay* APIs would return zeros for an offline display.
+            // Skip silently; the row will just be missing until reconnect.
+        }
+
         displays = updatedDisplays
         DisplayManagerAccessor.shared.displays = updatedDisplays
 
-        // Regenerate built-in presets (HiDPI 模式 / 原生模式) from updated display list.
+        // Regenerate built-in presets (HiDPI Mode / Native Mode) from updated display list.
         PresetService.shared.refreshBuiltins()
 
         // Only load details / refresh brightness for newly appeared displays
@@ -112,9 +149,10 @@ class DisplayManager: ObservableObject {
             }
         }
 
-        // For displays that were already present, only update bounds/main flag (no DDC probe).
-        let keptIDs = currentIDs.intersection(newIDSet)
-        for display in updatedDisplays where keptIDs.contains(display.displayID) {
+        // For displays that were already present and still active, only update bounds/main flag.
+        // Ghosts (disconnected) are skipped — querying CG for a disabled display returns zeros.
+        let keptActiveIDs = currentIDs.intersection(activeIDs)
+        for display in updatedDisplays where keptActiveIDs.contains(display.displayID) {
             display.bounds = CGDisplayBounds(display.displayID)
             display.isMain = CGDisplayIsMain(display.displayID) != 0
         }
