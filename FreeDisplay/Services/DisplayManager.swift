@@ -28,6 +28,12 @@ private func displayReconfigCallback(
 
         // Auto-rearrange after any display config change completes (debounced 500 ms).
         manager.scheduleAutoArrange()
+
+        // Persist the new arrangement (origins) so we can restore it after the
+        // app restarts. This captures every position change regardless of
+        // source — our own setPosition/align/calibrate calls, System Settings,
+        // hot plug. Cheap because it only writes to UserDefaults.
+        ArrangementService.shared.persistCurrentArrangement(of: manager.displays)
     }
 }
 
@@ -46,9 +52,10 @@ class DisplayManager: ObservableObject {
         setupReconfigCallback()
 
         // Restore persisted per-display state from the previous session: resolution,
-        // brightness, gamma, and disconnect status. Without this, ResolutionService's
-        // saved modeID only re-applied on wake-from-sleep, leaving every fresh app
-        // launch in whatever default mode WindowServer chose.
+        // brightness, gamma, arrangement (origins), and disconnect status. Without
+        // this, ResolutionService's saved modeID only re-applied on wake-from-sleep
+        // and arrangement changes done via calibration/align would reset every time
+        // the user rebuilt or reinstalled the app.
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 800_000_000)
             guard let self else { return }
@@ -57,6 +64,9 @@ class DisplayManager: ObservableObject {
                 BrightnessService.shared.reapplySoftwareBrightnessIfNeeded(for: display)
                 GammaService.shared.reapplyIfNeeded(for: display.displayID)
             }
+            // Order matters: arrangement before disconnect, so a display that was
+            // moved AND disconnected gets the right origin before going offline.
+            _ = await ArrangementService.shared.reapplyPersistedArrangement(among: self.displays)
             await DisplayConnectionService.shared.reapplyPersistedDisconnects(for: self.displays)
         }
     }
@@ -168,13 +178,17 @@ class DisplayManager: ObservableObject {
         // Already enabled — nothing to do
         guard !HiDPIService.shared.isHiDPIEnabled(vendor: vendor, product: product) else { return }
 
-        // Determine native resolution from available modes
-        let (nativeW, nativeH) = display.nativeResolution
+        // Use the UN-ROTATED native resolution. The plist override is keyed on
+        // the EDID framebuffer (always landscape); passing rotated dimensions
+        // either no-ops or triggers the double-rotation bug.
+        let (nativeW, nativeH) = display.nativeResolutionUnrotated
 
-        // Only auto-enable for 2K+ displays (width >= 2560 or total pixels >= 2560*1440)
-        guard nativeW >= 2560 || (nativeW * nativeH >= 2560 * 1440) else { return }
+        // Only auto-enable for 2K+ displays. Use max(w,h) so portrait ultrawides
+        // (which after un-rotation are 2560×1080 = 1080-tall but 2560-wide)
+        // also qualify, and keep the pixel-count fallback for safety.
+        guard max(nativeW, nativeH) >= 2560 || (nativeW * nativeH >= 2560 * 1440) else { return }
 
-        print("[DisplayManager] Auto-enabling HiDPI for \(display.name) (\(nativeW)×\(nativeH), vendor=\(vendor), product=\(product))")
+        print("[DisplayManager] Auto-enabling HiDPI for \(display.name) (unrotated \(nativeW)×\(nativeH), vendor=\(vendor), product=\(product))")
 
         let err = await HiDPIService.shared.enableHiDPI(
             for: display.displayID,

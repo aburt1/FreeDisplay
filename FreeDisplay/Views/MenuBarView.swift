@@ -69,10 +69,12 @@ struct MenuBarView: View {
     @ObservedObject private var virtualDisplayService = VirtualDisplayService.shared
     @State private var expandedDisplayIDs: Set<CGDirectDisplayID> = []
     @State private var showArrangement: Bool = false
+    @State private var showMore: Bool = false
     @State private var showVirtualDisplays: Bool = false
     @State private var showAutoBrightness: Bool = false
-    @State private var showSettings: Bool = false
     @State private var quitHovered = false
+    @State private var settingsHovered = false
+    @State private var settingsWindow: NSWindow?
 
     private var visibleDisplays: [DisplayInfo] {
         displayManager.displays.filter { !virtualDisplayService.isVirtualDisplay($0.displayID) }
@@ -103,26 +105,23 @@ struct MenuBarView: View {
                     }
                 }
 
-                // Preset list (Phase 19)
-                Divider()
-                    .opacity(0.3)
-                    .padding(.vertical, 2)
+                // Compact preset pill row — replaces the chunky full-width
+                // segmented control. The `+` to save lives inline with the chips.
+                Divider().opacity(0.3).padding(.vertical, 2)
+                PresetPillRow()
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
 
-                PresetListView()
-
-                // Arrange Displays section (Phase 4)
+                // Arrange Displays — primary multi-display surface
+                // (calibration + alignment all live in here).
                 if visibleDisplays.count > 1 {
-                    Divider()
-                        .opacity(0.3)
-                        .padding(.vertical, 2)
-
+                    Divider().opacity(0.3).padding(.vertical, 2)
                     ExpandableRow(
                         icon: "rectangle.3.offgrid",
                         iconColor: .blue,
                         label: "Arrange Displays",
                         isExpanded: $showArrangement
                     )
-
                     if showArrangement {
                         ArrangementView()
                             .environmentObject(displayManager)
@@ -130,76 +129,45 @@ struct MenuBarView: View {
                     }
                 }
 
-                Divider()
-                    .opacity(0.3)
-                    .padding(.vertical, 2)
-
-                // Combined brightness control (Phase 2)
-                if settings.showCombinedBrightness {
-                    CombinedBrightnessView(displays: displayManager.displays)
-                    Divider()
-                        .opacity(0.3)
-                        .padding(.vertical, 2)
-                }
-
-                // Tools section title
-                Text("Tools")
-                    .font(.caption2)
-                    .fontWeight(.semibold)
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
-                    .padding(.bottom, 2)
-
-                // Virtual Display tools entry (Phase 10)
+                // "More" — the power-user features (Virtual Display, Auto Brightness)
+                // collapsed by default so they don't compete with primary actions.
+                Divider().opacity(0.3).padding(.vertical, 2)
                 ExpandableRow(
-                    icon: "display.2",
-                    iconColor: .blue,
-                    label: "Virtual Display",
-                    isExpanded: $showVirtualDisplays
-                )
-
-                if showVirtualDisplays {
-                    VirtualDisplayView()
-                        .padding(.leading, 8)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-
-                // Auto Brightness entry (Phase 11)
-                ExpandableRow(
-                    icon: "sun.and.horizon.fill",
-                    iconColor: .orange,
-                    label: "Auto Brightness",
-                    isExpanded: $showAutoBrightness
-                )
-
-                if showAutoBrightness {
-                    AutoBrightnessView()
-                        .padding(.leading, 8)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-
-                Divider()
-                    .opacity(0.3)
-                    .padding(.vertical, 2)
-
-                // Settings section (Phase 12)
-                ExpandableRow(
-                    icon: "gearshape.fill",
+                    icon: "ellipsis.circle",
                     iconColor: .gray,
-                    label: "Settings",
-                    isExpanded: $showSettings
+                    label: "More",
+                    isExpanded: $showMore
                 )
-
-                if showSettings {
-                    SettingsView()
-                        .padding(.leading, 8)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                if showMore {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ExpandableRow(
+                            icon: "display.2",
+                            iconColor: .blue,
+                            label: "Virtual Display",
+                            isExpanded: $showVirtualDisplays
+                        )
+                        if showVirtualDisplays {
+                            VirtualDisplayView()
+                                .padding(.leading, 8)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                        ExpandableRow(
+                            icon: "sun.and.horizon.fill",
+                            iconColor: .orange,
+                            label: "Auto Brightness",
+                            isExpanded: $showAutoBrightness
+                        )
+                        if showAutoBrightness {
+                            AutoBrightnessView()
+                                .padding(.leading, 8)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                    }
+                    .padding(.leading, 8)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
-                Divider()
-                    .opacity(0.3)
-                    .padding(.vertical, 2)
+                Divider().opacity(0.3).padding(.vertical, 2)
 
                 // Update notice (Phase 12)
                 if updateService.hasUpdate, let ver = updateService.latestVersion {
@@ -228,7 +196,11 @@ struct MenuBarView: View {
             }
             .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(height: 560)
+        // Let the popover size to the actual content but cap at 700pt so a
+        // user with many displays + everything expanded still scrolls instead
+        // of overflowing the screen. The fixedSize(vertical: true) above gives
+        // the ScrollView a concrete content height to compose against.
+        .frame(maxHeight: 700)
 
         Divider().opacity(0.3)
 
@@ -239,6 +211,21 @@ struct MenuBarView: View {
                 .fontWeight(.medium)
                 .foregroundColor(.secondary)
             Spacer()
+            // Settings gear — opens a real Settings window (⌘, also works).
+            Button(action: { openSettingsWindow() }) {
+                Image(systemName: "gearshape")
+                    .font(.body)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(settingsHovered ? Color.primary.opacity(0.06) : .clear)
+                    .cornerRadius(6)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(settingsHovered ? .primary : .secondary)
+            .onHover { settingsHovered = $0 }
+            .help("Settings")
+
             Button(action: {
                 NSApplication.shared.terminate(nil)
             }) {
@@ -275,6 +262,125 @@ struct MenuBarView: View {
                 await updateService.checkForUpdates()
             }
         }
+    }
+
+    /// Opens (or focuses) a dedicated Settings window. We don't use the
+    /// `Settings { … }` Scene because LSUIElement apps don't get a proper app
+    /// menu wired up — instead we manage an `NSWindow` ourselves and bring it
+    /// to front. The window itself hosts the existing `SettingsView` SwiftUI.
+    @MainActor
+    private func openSettingsWindow() {
+        // If we already have a window open, just focus it.
+        if let existing = settingsWindow {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 360),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "FreeDisplay Settings"
+        win.center()
+        win.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: SettingsView()
+            .frame(width: 340)
+            .padding(.vertical, 12))
+        win.contentView = host
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow = win
+    }
+}
+
+// MARK: - PresetPillRow — compact presets strip
+
+/// Horizontal row of preset chips with an inline "+" save button. Replaces the
+/// previous chunky segmented control + separate "Save as Preset" row. Built-ins
+/// and user presets render identically; the active preset highlights in accent.
+struct PresetPillRow: View {
+    @ObservedObject private var presetService = PresetService.shared
+    @State private var showSaveSheet = false
+
+    var body: some View {
+        let presets = presetService.presets
+        let currentID = presetService.currentPresetMatch()
+
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(presets) { preset in
+                    PresetPill(
+                        preset: preset,
+                        isActive: currentID == preset.id,
+                        isApplying: presetService.applyingPresetID == preset.id,
+                        isDisabled: presetService.isApplying
+                    )
+                }
+
+                // Inline "+" to save the current state as a new preset.
+                Button(action: { showSaveSheet = true }) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 26, height: 22)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+                .help("Save current display configuration as a preset")
+            }
+        }
+        .sheet(isPresented: $showSaveSheet) {
+            SavePresetView()
+        }
+    }
+}
+
+/// A single pill button representing one preset.
+private struct PresetPill: View {
+    let preset: DisplayPreset
+    let isActive: Bool
+    let isApplying: Bool
+    let isDisabled: Bool
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: apply) {
+            HStack(spacing: 4) {
+                if isApplying {
+                    ProgressView().scaleEffect(0.4).frame(width: 10, height: 10)
+                } else {
+                    Image(systemName: preset.icon)
+                        .font(.caption2)
+                        .foregroundColor(isActive ? .white : .secondary)
+                }
+                Text(preset.name)
+                    .font(.caption)
+                    .fontWeight(isActive ? .medium : .regular)
+                    .foregroundColor(isActive ? .white : .primary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6).fill(
+                    isActive ? Color.accentColor
+                    : isHovered ? Color.primary.opacity(0.08)
+                    : Color.primary.opacity(0.04)
+                )
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { isHovered = $0 }
+        .help(isActive ? "Currently active" : "Apply preset: \(preset.name)")
+    }
+
+    private func apply() {
+        guard !isDisabled else { return }
+        Task { await PresetService.shared.applyPreset(preset) }
     }
 }
 

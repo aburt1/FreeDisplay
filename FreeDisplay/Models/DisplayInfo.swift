@@ -48,6 +48,21 @@ class DisplayInfo: ObservableObject, Identifiable {
         return (nativeMode?.width ?? pixelWidth, nativeMode?.height ?? pixelHeight)
     }
 
+    /// Same as `nativeResolution` but un-rotated to match the framebuffer the
+    /// GPU actually scans out. `CGDisplayCopyAllDisplayModes` reports modes in
+    /// the *current* rotated orientation (e.g. a 2560×1080 ultrawide rotated
+    /// 90° reports 1080×2560), but the HiDPI plist override in
+    /// `/Library/Displays/.../Overrides/` is keyed on the *unrotated* EDID
+    /// framebuffer — rotation is a WindowServer composition transform that
+    /// happens after the buffer. Passing rotated dimensions into the override
+    /// silently no-ops (the framebuffer never runs portrait) and triggers the
+    /// double-rotation bug documented in waydabber/BetterDisplay#4672.
+    var nativeResolutionUnrotated: (width: Int, height: Int) {
+        let (w, h) = nativeResolution
+        let rot = Int(CGDisplayRotation(displayID).rounded()) % 180
+        return rot == 0 ? (w, h) : (h, w)
+    }
+
     init(displayID: CGDirectDisplayID) {
         self.displayID = displayID
         let builtin = CGDisplayIsBuiltin(displayID) != 0

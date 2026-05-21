@@ -9,6 +9,75 @@ class ArrangementService {
     static let shared = ArrangementService()
     private init() {}
 
+    // MARK: - Persistence
+    //
+    // Display origins are persisted across app restarts so a calibration the
+    // user committed survives rebuild/reinstall — `kCGConfigureForSession` is
+    // documented to last the login session, but in practice it can be reset
+    // when the previous config owner exits or when the bundle on disk is
+    // replaced. We treat UserDefaults as the source of truth and reapply on
+    // launch from `DisplayManager.init`.
+    private static let kPersistKey = "fd.persistedArrangement"
+
+    private static var persistedOrigins: [String: [Int]] {
+        get {
+            UserDefaults.standard.dictionary(forKey: kPersistKey) as? [String: [Int]] ?? [:]
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: kPersistKey)
+        }
+    }
+
+    /// Snapshots the current X/Y origin of every non-builtin display so we can
+    /// restore it on the next app launch. Call after any successful operation
+    /// that moves displays — setPosition, alignVerticalCenters,
+    /// setAsMainDisplay, or the calibration apply path.
+    func persistCurrentArrangement(of displays: [DisplayInfo]) {
+        var origins = Self.persistedOrigins
+        for d in displays where !d.isBuiltin {
+            origins[d.displayUUID] = [Int(d.bounds.origin.x), Int(d.bounds.origin.y)]
+        }
+        Self.persistedOrigins = origins
+    }
+
+    /// Reapplies the saved origins (if any) to the given displays. Called by
+    /// `DisplayManager.init` after a brief settle delay so WindowServer isn't
+    /// fighting our own reconfig callback.
+    @discardableResult
+    func reapplyPersistedArrangement(among displays: [DisplayInfo]) async -> Bool {
+        let origins = Self.persistedOrigins
+        guard !origins.isEmpty else { return true }
+
+        // Build the diff: only push displays whose current origin differs from
+        // what's persisted, to avoid no-op churn on every launch.
+        let updates: [(id: CGDirectDisplayID, x: Int32, y: Int32)] = displays.compactMap { d in
+            guard !d.isBuiltin,
+                  let saved = origins[d.displayUUID],
+                  saved.count == 2 else { return nil }
+            let (sx, sy) = (saved[0], saved[1])
+            if Int(d.bounds.origin.x) == sx, Int(d.bounds.origin.y) == sy {
+                return nil
+            }
+            return (id: d.displayID, x: Int32(sx), y: Int32(sy))
+        }
+        guard !updates.isEmpty else { return true }
+
+        return await CGHelpers.runWithTimeout(seconds: 10, fallback: false) {
+            var config: CGDisplayConfigRef?
+            guard CGBeginDisplayConfiguration(&config) == .success,
+                  let cfg = config else { return false }
+            for u in updates {
+                CGConfigureDisplayOrigin(cfg, u.id, u.x, u.y)
+            }
+            let result = CGCompleteDisplayConfiguration(cfg, .forSession)
+            if result != .success {
+                CGCancelDisplayConfiguration(cfg)
+                return false
+            }
+            return true
+        }
+    }
+
     /// Moves the given display to the specified position in the global coordinate space.
     /// The entire Begin→Origin→Complete transaction runs inside `CGHelpers.runWithTimeout`
     /// so `CGCompleteDisplayConfiguration` cannot block indefinitely on WindowServer IPC.
