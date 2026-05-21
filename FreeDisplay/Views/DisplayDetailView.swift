@@ -27,10 +27,10 @@ struct DisplayDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
 
-            // Brightness slider
-            BrightnessSliderView(display: display)
-
-            Divider().opacity(0.3).padding(.vertical, 2)
+            // Brightness lives on the parent display row now (Glanceable Stack
+            // pattern). The full BrightnessSliderView remains in source if we
+            // ever want to surface DDC/Software mode + contrast behind an
+            // "Advanced…" section.
 
             // HiDPI toggle — before mode list (natural workflow: enable HiDPI → pick resolution)
             HiDPIRowView(display: display)

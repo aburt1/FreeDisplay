@@ -7,12 +7,70 @@ struct ArrangementView: View {
     @EnvironmentObject var displayManager: DisplayManager
     @State private var draggedID: CGDirectDisplayID?
     @State private var dragOffset: CGSize = .zero
+    /// Translation after edge-snap is applied — what's actually committed on drag-end.
+    @State private var snappedOffset: CGSize = .zero
+    /// Active alignment guide lines in canvas space. Drawn while the dragged
+    /// thumbnail's edge is snapped to another display's edge.
+    @State private var snapGuides: [SnapGuide] = []
     @State private var dragError: String?
 
     private let canvasHeight: CGFloat = 160
+    /// Canvas-pixel threshold within which an edge magnetically snaps.
+    private let snapThreshold: CGFloat = 8
+
+    /// True when the main display and any non-main display have non-matching
+    /// vertical centers (which is what causes cursor-jump between displays).
+    /// Used to dim the Align button when there's nothing to fix.
+    private var centersMisaligned: Bool {
+        guard let main = displayManager.displays.first(where: { $0.isMain }) else { return false }
+        let mainMidY = main.bounds.midY
+        return displayManager.displays.contains { d in
+            !d.isMain && abs(d.bounds.midY - mainMidY) > 0.5
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Quick-align row. Each button lives on its own line of intent —
+            // we deliberately keep this very small so it doesn't dominate.
+            HStack(spacing: 6) {
+                Button {
+                    Task { @MainActor in
+                        let ok = await ArrangementService.shared.alignVerticalCenters(
+                            among: displayManager.displays
+                        )
+                        if ok { displayManager.refreshDisplays() }
+                    }
+                } label: {
+                    Label("Align Centers", systemImage: "align.vertical.center")
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.accentColor.opacity(centersMisaligned ? 0.15 : 0.06))
+                        .foregroundColor(centersMisaligned ? .accentColor : .secondary)
+                        .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+                .disabled(displayManager.displays.count < 2)
+                .help("Aligns every other display's vertical center with the main display so the cursor crosses smoothly between them at any height.")
+
+                Button {
+                    CrossingCalibrationService.shared.begin(displays: displayManager.displays)
+                } label: {
+                    Label("Calibrate Crossing", systemImage: "arrow.left.and.right")
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.primary.opacity(0.06))
+                        .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+                .disabled(displayManager.displays.count < 2)
+                .help("Interactive calibration: drag a line on each display to mark the natural crossing point, then we'll align the displays so the cursor flows smoothly between those points.")
+
+                Spacer()
+            }
+
             // Visual canvas
             GeometryReader { geo in
                 ZStack {
@@ -23,6 +81,14 @@ struct ArrangementView: View {
                             RoundedRectangle(cornerRadius: 6)
                                 .stroke(Color.gray.opacity(0.3), lineWidth: 1)
                         )
+
+                    // Alignment guides (rendered behind thumbnails so the dragged
+                    // thumbnail stays visible on top of the line).
+                    ForEach(snapGuides) { guide in
+                        guide.path
+                            .stroke(Color.accentColor.opacity(0.85),
+                                    style: StrokeStyle(lineWidth: 1.2, dash: [3, 2]))
+                    }
 
                     // Display thumbnails
                     thumbnails(canvasSize: geo.size)
@@ -72,11 +138,14 @@ struct ArrangementView: View {
         ForEach(displayManager.displays) { display in
             let rect = layout[display.displayID] ?? CGRect(x: canvasSize.width / 2, y: canvasSize.height / 2, width: 60, height: 40)
             let isDragged = draggedID == display.displayID
+            // Use the snapped offset for the dragged thumbnail's position so the
+            // thumbnail visibly clicks into alignment, not just the drop result.
+            let activeOffset = isDragged ? snappedOffset : .zero
             DisplayThumbnailView(display: display, isDragged: isDragged)
                 .frame(width: max(rect.width, 40), height: max(rect.height, 25))
                 .position(
-                    x: rect.midX + (isDragged ? dragOffset.width : 0),
-                    y: rect.midY + (isDragged ? dragOffset.height : 0)
+                    x: rect.midX + activeOffset.width,
+                    y: rect.midY + activeOffset.height
                 )
                 .help("Display: \(display.name)")
                 .gesture(
@@ -84,14 +153,131 @@ struct ArrangementView: View {
                         .onChanged { value in
                             draggedID = display.displayID
                             dragOffset = value.translation
+                            let result = snapResult(
+                                draggedID: display.displayID,
+                                rawTranslation: value.translation,
+                                layout: layout
+                            )
+                            snappedOffset = result.translation
+                            snapGuides = result.guides
                         }
                         .onEnded { value in
-                            applyDrag(for: display, translation: value.translation, layout: layout, canvasSize: canvasSize)
+                            let result = snapResult(
+                                draggedID: display.displayID,
+                                rawTranslation: value.translation,
+                                layout: layout
+                            )
+                            applyDrag(
+                                for: display,
+                                translation: result.translation,
+                                layout: layout,
+                                canvasSize: canvasSize
+                            )
                             draggedID = nil
                             dragOffset = .zero
+                            snappedOffset = .zero
+                            snapGuides = []
                         }
                 )
         }
+    }
+
+    // MARK: - Snap logic
+
+    /// Computes the snapped translation and the guide lines to render, given the
+    /// raw drag translation. Snaps when the dragged thumbnail's top/center/bottom
+    /// edges are within `snapThreshold` of any other display's top/center/bottom
+    /// (Y-axis snap), and similarly for left/center/right (X-axis snap).
+    /// Selects the closest candidate per axis independently.
+    private func snapResult(
+        draggedID id: CGDirectDisplayID,
+        rawTranslation: CGSize,
+        layout: [CGDirectDisplayID: CGRect]
+    ) -> (translation: CGSize, guides: [SnapGuide]) {
+        guard let origRect = layout[id] else {
+            return (rawTranslation, [])
+        }
+        let dragged = origRect.offsetBy(dx: rawTranslation.width, dy: rawTranslation.height)
+
+        let others = layout
+            .filter { $0.key != id }
+            .map { $0.value }
+        guard !others.isEmpty else {
+            return (rawTranslation, [])
+        }
+
+        // For each axis, candidate "anchor lines" on the dragged rect.
+        let xCandidates: [(name: String, value: CGFloat)] = [
+            ("min", dragged.minX), ("mid", dragged.midX), ("max", dragged.maxX),
+        ]
+        let yCandidates: [(name: String, value: CGFloat)] = [
+            ("min", dragged.minY), ("mid", dragged.midY), ("max", dragged.maxY),
+        ]
+
+        // Best X snap: smallest distance between any dragged-X-anchor and any
+        // other-display-X-anchor (including each other's edges + centers).
+        var bestX: (delta: CGFloat, line: CGFloat)? = nil
+        var bestY: (delta: CGFloat, line: CGFloat)? = nil
+
+        for other in others {
+            let otherXs: [CGFloat] = [other.minX, other.midX, other.maxX]
+            let otherYs: [CGFloat] = [other.minY, other.midY, other.maxY]
+
+            for cand in xCandidates {
+                for ox in otherXs {
+                    let d = ox - cand.value
+                    if abs(d) <= snapThreshold,
+                       bestX == nil || abs(d) < abs(bestX!.delta) {
+                        bestX = (delta: d, line: ox)
+                    }
+                }
+            }
+            for cand in yCandidates {
+                for oy in otherYs {
+                    let d = oy - cand.value
+                    if abs(d) <= snapThreshold,
+                       bestY == nil || abs(d) < abs(bestY!.delta) {
+                        bestY = (delta: d, line: oy)
+                    }
+                }
+            }
+        }
+
+        let adjustedTranslation = CGSize(
+            width: rawTranslation.width + (bestX?.delta ?? 0),
+            height: rawTranslation.height + (bestY?.delta ?? 0)
+        )
+
+        // Build guide-line paths: vertical line at bestX, horizontal at bestY.
+        // Each extends a bit past the union of dragged + the closest other,
+        // so the line visually connects what's aligning.
+        let finalRect = origRect.offsetBy(dx: adjustedTranslation.width, dy: adjustedTranslation.height)
+        var guides: [SnapGuide] = []
+        if let bx = bestX {
+            // Find the y-range to draw across (union of finalRect Y and the other displays')
+            let yMin = others.map(\.minY).min().map { min($0, finalRect.minY) } ?? finalRect.minY
+            let yMax = others.map(\.maxY).max().map { max($0, finalRect.maxY) } ?? finalRect.maxY
+            guides.append(SnapGuide(
+                id: "x",
+                path: Path { p in
+                    p.move(to: CGPoint(x: bx.line, y: yMin - 6))
+                    p.addLine(to: CGPoint(x: bx.line, y: yMax + 6))
+                }
+            ))
+        }
+        if let by = bestY {
+            let xMin = others.map(\.minX).min().map { min($0, finalRect.minX) } ?? finalRect.minX
+            let xMax = others.map(\.maxX).max().map { max($0, finalRect.maxX) } ?? finalRect.maxX
+            guides.append(SnapGuide(
+                id: "y",
+                path: Path { p in
+                    p.move(to: CGPoint(x: xMin - 6, y: by.line))
+                    p.addLine(to: CGPoint(x: xMax + 6, y: by.line))
+                }
+            ))
+        }
+
+        return (adjustedTranslation, guides)
     }
 
     /// Computes the canvas-space rect for each display, scaled to fit the canvas.
@@ -233,4 +419,13 @@ private struct DisplayThumbnailView: View {
         .shadow(color: .black.opacity(isDragged ? 0.3 : 0.05), radius: isDragged ? 6 : 1)
         .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isDragged)
     }
+}
+
+// MARK: - SnapGuide
+
+/// A single alignment guide line (horizontal or vertical) rendered while
+/// the user is dragging a display thumbnail near another display's edge.
+private struct SnapGuide: Identifiable {
+    let id: String
+    let path: Path
 }

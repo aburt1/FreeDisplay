@@ -376,69 +376,113 @@ struct DisplayRowView: View {
     let isExpanded: Bool
     let onToggleExpand: () -> Void
 
+    private var accent: Color {
+        display.isDisconnected ? .gray : DisplayAccent.color(for: display.displayUUID)
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            HStack {
+        VStack(alignment: .leading, spacing: 6) {
+            // Top line: identity + name + main badge + disconnect toggle.
+            // Tapping anywhere in this strip (except the toggle) expands the row.
+            HStack(spacing: 8) {
                 Image(systemName: "chevron.right")
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundColor(.secondary)
-                    .frame(width: 16)
+                    .frame(width: 10)
                     .rotationEffect(Angle(degrees: isExpanded ? 90 : 0))
                     .animation(.easeInOut(duration: 0.2), value: isExpanded)
                     .accessibilityHidden(true)
 
-                MenuItemIcon(
-                    systemName: display.isBuiltin ? "laptopcomputer" : "display",
-                    color: display.isDisconnected ? .gray : .blue
-                )
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(display.name)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .foregroundColor(display.isDisconnected ? .secondary : .primary)
-                    if let mode = display.currentDisplayMode {
-                        Text(display.isDisconnected ? "Disconnected" : mode.resolutionString)
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                    }
-                }
+                // Accent identity dot — same color used by the slider tint and
+                // the identify-display flash overlay, so the link is obvious.
+                Circle()
+                    .fill(accent)
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .accessibilityHidden(true)
+
+                Image(systemName: display.isBuiltin ? "laptopcomputer" : "display")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .accessibilityHidden(true)
+
+                Text(display.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundColor(display.isDisconnected ? .secondary : .primary)
+
                 if display.isMain {
-                    Text("Main Display")
-                        .font(.caption2)
-                        .foregroundColor(.blue)
-                        .padding(.horizontal, 4)
+                    Text("Main")
+                        .font(.caption2.weight(.medium))
+                        .foregroundColor(accent)
+                        .padding(.horizontal, 5)
                         .padding(.vertical, 1)
-                        .background(Color.blue.opacity(0.12))
+                        .background(accent.opacity(0.15))
                         .cornerRadius(3)
                 }
-                Spacer()
+
+                Spacer(minLength: 4)
+
+                // Disconnect toggle — its own gesture, won't trigger row expand.
+                Toggle("", isOn: Binding(
+                    get: { !display.isDisconnected },
+                    set: { newValue in
+                        guard !display.isTogglingConnection else { return }
+                        Task { await DisplayConnectionService.shared.setConnected(newValue, for: display) }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+                .disabled(display.isTogglingConnection || !DisplayConnectionService.shared.symbolsLoaded)
+                .help(display.isDisconnected ? "Reconnect display" : "Disconnect display (macOS will treat it as offline)")
             }
             .contentShape(Rectangle())
             .onTapGesture { onToggleExpand() }
-            .help("Expand display control panel")
 
-            // Disconnect toggle. Tells WindowServer the display is offline via
-            // the private SkyLight symbol CGSConfigureDisplayEnabled.
-            Toggle("", isOn: Binding(
-                get: { !display.isDisconnected },
-                set: { newValue in
-                    guard !display.isTogglingConnection else { return }
-                    Task { await DisplayConnectionService.shared.setConnected(newValue, for: display) }
+            // Inline brightness slider — the modal task, zero clicks to access.
+            // Hidden for disconnected displays since DDC/gamma won't reach them.
+            if !display.isDisconnected {
+                CompactBrightnessSlider(display: display, accent: accent)
+                    .padding(.leading, 27)   // align under name (past chevron + dot + icon)
+            }
+
+            // Footnote: resolution / status.
+            HStack(spacing: 4) {
+                if display.isDisconnected {
+                    Text("Disconnected")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else if let mode = display.currentDisplayMode {
+                    Text(mode.resolutionString)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    if mode.isHiDPI {
+                        Text("·").font(.caption2).foregroundColor(.secondary)
+                        Text("HiDPI").font(.caption2).foregroundColor(.secondary)
+                    }
                 }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .labelsHidden()
-            .disabled(display.isTogglingConnection || !DisplayConnectionService.shared.symbolsLoaded)
-            .help(display.isDisconnected ? "Reconnect display" : "Disconnect display (makes macOS treat it as offline)")
-            .padding(.trailing, 4)
+            }
+            .padding(.leading, 27)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color.primary.opacity(isHovered ? 0.06 : 0))
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(isHovered ? 0.05 : 0))
+                .padding(.horizontal, 4)
+        )
         .animation(.easeInOut(duration: 0.15), value: isHovered)
-        .onHover { isHovered = $0 }
+        .onHover { hovering in
+            isHovered = hovering
+            // Identify-display flash on sustained hover; debounced in the service.
+            if hovering && !display.isDisconnected {
+                IdentifyDisplayService.shared.scheduleFlash(for: display)
+            } else {
+                IdentifyDisplayService.shared.cancelScheduled(for: display.displayID)
+            }
+        }
         .contextMenu {
             Button {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.Displays-Settings") {
